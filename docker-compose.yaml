@@ -1,0 +1,48 @@
+version: "3.8"
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+    - POSTGRES_USER=${DB_USER}
+    - POSTGRES_PASSWORD=${DB_PASSWORD}
+    - POSTGRES_DB=${DB_NAME}
+    - DATABASE_HOST=${DB_HOST}
+    - DATABASE_PORT=${DB_PORT}
+    - DATABASE_URL=${DB_URL}
+    - EXPOSED_PORT=${EXPOSED_PORT}
+    ports:
+      - 8080:8080
+    volumes:
+      - ./:/app
+    depends_on:
+      - postgresdb
+    networks:
+      - my-network
+    tty: true
+    restart: on-failure
+
+
+  postgresdb:
+    image: postgres:latest
+    container_name: db
+    user: postgres 
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=SPuser96
+      - POSTGRES_DB=project
+      - DATABASE_HOST=postgresdb
+    networks:
+      - my-network
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    ports:
+      - 1234:5432
+
+volumes:
+  pg_data:
+
+networks:
+  my-network:
+    driver: bridge
