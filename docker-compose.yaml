@@ -12,8 +12,10 @@ services:
     - DATABASE_PORT=${DB_PORT}
     - DATABASE_URL=${DB_URL}
     - EXPOSED_PORT=${EXPOSED_PORT}
+    - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID}
+    - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET}
     ports:
-      - 8080:8080
+      - 8000:8000
     volumes:
       - ./:/app
     depends_on:
