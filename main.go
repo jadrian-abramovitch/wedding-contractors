@@ -8,9 +8,11 @@ import (
 	"os"
 	"sort"
 	"text/template"
+	"time"
 	"wedding-contractors/auth"
 
 	"github.com/gorilla/pat"
+	"github.com/gorilla/sessions"
 	"github.com/jackc/pgx/v5"
 	"github.com/markbates/goth/gothic"
 )
@@ -21,10 +23,11 @@ type Page struct {
 }
 
 type User struct {
-	userId    int    `db:userId`
-	firstName string `db: firstName`
-	lastName  string `db: lastName`
-	email     string `db: email`
+	userId      int    `db:userId`
+	firstName   string `db: firstName`
+	lastName    string `db: lastName`
+	authService string `db: authService`
+	idToken     string `db: idToken`
 }
 
 func handler(w http.ResponseWriter, r *http.Request) {
@@ -36,13 +39,18 @@ func handler(w http.ResponseWriter, r *http.Request) {
 
 func bootstrapData(conn *pgx.Conn) error {
 
-	_, err := conn.Exec(context.Background(), "CREATE TABLE IF NOT EXISTS users (userId BIGINT, firstName TEXT, lastName TEXT, email TEXT)")
+	_, err := conn.Exec(context.Background(), "DROP TABLE IF EXISTS users")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Unable to create tables: %v\n", err)
+		return err
+	}
+	_, err = conn.Exec(context.Background(), "CREATE TABLE IF NOT EXISTS users (userId integer primary key generated always as identity, firstName TEXT, lastName TEXT, authService TEXT, idToken TEXT)")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Unable to create tables: %v\n", err)
 		return err
 	}
 
-	_, err = conn.Exec(context.Background(), "INSERT INTO users (userId, firstName, lastName, email) VALUES (1, 'Lauren', 'Homann', 'test@gmail.com')")
+	_, err = conn.Exec(context.Background(), "INSERT INTO users (firstName, lastName, authService, idToken) VALUES ('Lauren', 'Homann', 'google', '1')")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Unable to insert users: %v\n", err)
 		return err
@@ -51,7 +59,6 @@ func bootstrapData(conn *pgx.Conn) error {
 }
 
 func main() {
-
 	auth.NewAuth()
 
 	m := map[string]string{
@@ -77,16 +84,43 @@ func main() {
 	}
 
 	p := pat.New()
+	var store = sessions.NewCookieStore([]byte(os.Getenv("SESSION_KEY")))
 	p.Get("/users", func(w http.ResponseWriter, r *http.Request) {
-		// var email string
-		var user User
-		err := conn.QueryRow(context.Background(), "SELECT email FROM users where userId=$1", 1).Scan(&user.email)
+		session, err := store.Get(r, "session-name")
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		idToken := session.Values["idToken"]
+		fmt.Printf("idToken: %s\n", idToken)
+		var email string
+		// var user User
+		err = conn.QueryRow(context.Background(), "SELECT idToken FROM users where userId=$1", 2).Scan(&email)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error selecting users: %v\n", err)
 		}
 		t, _ := template.ParseFiles("users.html")
-		fmt.Println(user)
-		t.Execute(w, user)
+		fmt.Println(email)
+		t.Execute(w, email)
+	})
+
+	p.Get("/cookies", func(res http.ResponseWriter, req *http.Request) {
+		// Get a session. Get() always returns a session, even if empty.
+		session, err := store.Get(req, "session-name")
+		if err != nil {
+			http.Error(res, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		// Set some session values.
+		session.Values["foo"] = "bar"
+		session.Values[42] = 43
+		// Save it before we write to the response/return from the handler.
+		err = session.Save(req, res)
+		if err != nil {
+			http.Error(res, err.Error(), http.StatusInternalServerError)
+			return
+		}
 	})
 
 	p.Get("/auth/{provider}/callback", func(res http.ResponseWriter, req *http.Request) {
@@ -96,6 +130,29 @@ func main() {
 			fmt.Fprintln(res, err)
 			return
 		}
+
+		session, err := store.Get(req, "session-name")
+		if err != nil {
+			http.Error(res, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		session.Values["idToken"] = user.IDToken
+		err = session.Save(req, res)
+		if err != nil {
+			http.Error(res, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		if !time.Now().Before(user.ExpiresAt) {
+			fmt.Println("token is not expired yet")
+		} else {
+			_, err = conn.Exec(context.Background(), "INSERT INTO users (firstName, lastName, authService, idToken) VALUES ($1, $2, $3, $4)", user.FirstName, user.LastName, "google", user.IDToken)
+			if err != nil {
+				fmt.Fprintln(res, err)
+				return
+			}
+		}
+
 		t, _ := template.New("foo").Parse(userTemplate)
 		t.Execute(res, user)
 	})
