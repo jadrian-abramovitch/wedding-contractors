@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"sort"
+	"strings"
 	"text/template"
 	"time"
 	"wedding-contractors/auth"
@@ -28,6 +29,10 @@ type User struct {
 	lastName    string `db: lastName`
 	authService string `db: authService`
 	idToken     string `db: idToken`
+}
+
+type CustomStore struct {
+	cookies *sessions.CookieStore
 }
 
 func handler(w http.ResponseWriter, r *http.Request) {
@@ -58,6 +63,28 @@ func bootstrapData(conn *pgx.Conn) error {
 	return nil
 }
 
+func (store *CustomStore) AuthMiddleware(next http.Handler) http.Handler {
+	cookieStore := store.cookies
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/auth") {
+			fmt.Println("skip middle ware")
+			next.ServeHTTP(w, r)
+			return
+		}
+		session, err := cookieStore.Get(r, "session-name")
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if session.Values["idToken"] == nil {
+			fmt.Println("user must log in")
+		}
+		fmt.Printf("session: %s\n", session.Values["idToken"])
+		fmt.Println("hello from middle ware")
+		next.ServeHTTP(w, r)
+	})
+}
+
 func main() {
 	auth.NewAuth()
 
@@ -85,6 +112,8 @@ func main() {
 
 	p := pat.New()
 	var store = sessions.NewCookieStore([]byte(os.Getenv("SESSION_KEY")))
+	amw := CustomStore{cookies: store}
+	p.Use(amw.AuthMiddleware)
 	p.Get("/users", func(w http.ResponseWriter, r *http.Request) {
 		session, err := store.Get(r, "session-name")
 		if err != nil {
