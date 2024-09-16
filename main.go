@@ -33,6 +33,7 @@ type User struct {
 
 type CustomStore struct {
 	cookies *sessions.CookieStore
+	db      *pgx.Conn
 }
 
 func handler(w http.ResponseWriter, r *http.Request) {
@@ -66,7 +67,7 @@ func bootstrapData(conn *pgx.Conn) error {
 func (store *CustomStore) AuthMiddleware(next http.Handler) http.Handler {
 	cookieStore := store.cookies
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasPrefix(r.URL.Path, "/auth") {
+		if strings.HasPrefix(r.URL.Path, "/auth") || strings.HasPrefix(r.URL.Path, "/users") {
 			fmt.Println("skip middle ware")
 			next.ServeHTTP(w, r)
 			return
@@ -78,6 +79,28 @@ func (store *CustomStore) AuthMiddleware(next http.Handler) http.Handler {
 		}
 		if session.Values["idToken"] == nil {
 			fmt.Println("user must log in")
+			http.Redirect(w, r, "/auth/login", http.StatusTemporaryRedirect)
+			return
+		}
+		// check that the idToken is actually valid
+		rows, err := store.db.Query(context.Background(), "SELECT idToken FROM users")
+		if err != nil {
+			fmt.Println("Query to get tokens didn't work")
+		}
+		matched := false
+		var dbToken string
+		// this does not scale well at all, need to figure out how to embed userId into cookie
+		for rows.Next() {
+			rows.Scan(&dbToken)
+			fmt.Printf("dbToken: %s\n", dbToken)
+			if dbToken == session.Values["idToken"] {
+				matched = true
+			}
+		}
+		if !matched {
+			fmt.Println("user must log in 2")
+			http.Redirect(w, r, "/auth/login", http.StatusTemporaryRedirect)
+			return
 		}
 		fmt.Printf("session: %s\n", session.Values["idToken"])
 		fmt.Println("hello from middle ware")
@@ -112,7 +135,7 @@ func main() {
 
 	p := pat.New()
 	var store = sessions.NewCookieStore([]byte(os.Getenv("SESSION_KEY")))
-	amw := CustomStore{cookies: store}
+	amw := CustomStore{cookies: store, db: conn}
 	p.Use(amw.AuthMiddleware)
 	p.Get("/users", func(w http.ResponseWriter, r *http.Request) {
 		session, err := store.Get(r, "session-name")
@@ -192,6 +215,11 @@ func main() {
 		res.WriteHeader(http.StatusTemporaryRedirect)
 	})
 
+	p.Get("/auth/login", func(res http.ResponseWriter, req *http.Request) {
+		fmt.Println("test from /auth/login")
+		t, _ := template.New("foo").Parse(indexTemplate)
+		t.Execute(res, providerIndex)
+	})
 	p.Get("/auth/{provider}", func(res http.ResponseWriter, req *http.Request) {
 		// try to get the user without re-authenticating
 		if gothUser, err := gothic.CompleteUserAuth(res, req); err == nil {
@@ -203,8 +231,8 @@ func main() {
 	})
 
 	p.Get("/", func(res http.ResponseWriter, req *http.Request) {
-		t, _ := template.New("foo").Parse(indexTemplate)
-		t.Execute(res, providerIndex)
+		t, _ := template.New("home").Parse(homeTemplate)
+		t.Execute(res, 1)
 	})
 
 	fmt.Println("listening on http://localhost:")
@@ -234,3 +262,4 @@ var userTemplate = `
 <p>ExpiresAt: {{.ExpiresAt}}</p>
 <p>RefreshToken: {{.RefreshToken}}</p>
 `
+var homeTemplate = `<h1>Home</h1>`
