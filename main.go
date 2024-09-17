@@ -82,21 +82,38 @@ func (store *CustomStore) AuthMiddleware(next http.Handler) http.Handler {
 			http.Redirect(w, r, "/auth/login", http.StatusTemporaryRedirect)
 			return
 		}
-		// check that the idToken is actually valid
-		rows, err := store.db.Query(context.Background(), "SELECT idToken FROM users")
-		if err != nil {
-			fmt.Println("Query to get tokens didn't work")
+		if session.Values["userId"] == nil {
+			fmt.Println("user has no id")
+			http.Redirect(w, r, "/auth/login", http.StatusTemporaryRedirect)
+			return
 		}
+		incomingId, ok := session.Values["userId"].(int)
+		if !ok {
+			fmt.Println("couldn't make user id an int")
+		}
+		fmt.Printf("userId is: %d\n", session.Values["userId"])
+		// check that the idToken is actually valid
+		// no way that is actually properly validated and escaped, right?????
+		row := store.db.QueryRow(context.Background(), "SELECT idToken FROM users WHERE userId=$1", incomingId)
+		// TODO check err
+		// if err != nil {
+		// 	fmt.Println("Query to get tokens didn't work")
+		// }
 		matched := false
 		var dbToken string
-		// this does not scale well at all, need to figure out how to embed userId into cookie
-		for rows.Next() {
-			rows.Scan(&dbToken)
-			fmt.Printf("dbToken: %s\n", dbToken)
-			if dbToken == session.Values["idToken"] {
-				matched = true
-			}
+		row.Scan(dbToken)
+		fmt.Printf("db token: %s, incoming: %s", dbToken, session.Values["idToken"])
+		if dbToken == session.Values["idToken"] {
+			matched = true
 		}
+		// this does not scale well at all, need to figure out how to embed userId into cookie
+		// for rows.Next() {
+		// 	rows.Scan(&dbToken)
+		// 	fmt.Printf("dbToken: %s\n", dbToken)
+		// 	if dbToken == session.Values["idToken"] {
+		// 		matched = true
+		// 	}
+		// }
 		if !matched {
 			fmt.Println("user must log in 2")
 			http.Redirect(w, r, "/auth/login", http.StatusTemporaryRedirect)
@@ -188,29 +205,37 @@ func main() {
 			http.Error(res, err.Error(), http.StatusInternalServerError)
 			return
 		}
+
+		if !time.Now().Before(user.ExpiresAt) {
+			fmt.Println("token is not expired yet")
+			return
+		}
+		var id int
+		// this shouldn't always insert, should update if user existed before but not logged in
+		row := conn.QueryRow(context.Background(), "INSERT INTO users (firstName, lastName, authService, idToken) VALUES ($1, $2, $3, $4) RETURNING userId", user.FirstName, user.LastName, "google", user.IDToken)
+		// check error TODO
+		row.Scan(&id)
+		fmt.Printf("id: %d\n", id)
+		// if err != nil {
+		// 	fmt.Fprintln(res, err)
+		// 	return
+		// }
+
 		session.Values["idToken"] = user.IDToken
+		session.Values["userId"] = id
 		err = session.Save(req, res)
 		if err != nil {
 			http.Error(res, err.Error(), http.StatusInternalServerError)
 			return
 		}
-
-		if !time.Now().Before(user.ExpiresAt) {
-			fmt.Println("token is not expired yet")
-		} else {
-			_, err = conn.Exec(context.Background(), "INSERT INTO users (firstName, lastName, authService, idToken) VALUES ($1, $2, $3, $4)", user.FirstName, user.LastName, "google", user.IDToken)
-			if err != nil {
-				fmt.Fprintln(res, err)
-				return
-			}
-		}
-
 		t, _ := template.New("foo").Parse(userTemplate)
 		t.Execute(res, user)
 	})
 
 	p.Get("/logout/{provider}", func(res http.ResponseWriter, req *http.Request) {
 		gothic.Logout(res, req)
+		fmt.Printf("url user: %s\n", req.URL.User)
+		// _, err = conn.Exec(context.Background(), "DELETE FROM users WHERE ")
 		res.Header().Set("Location", "/")
 		res.WriteHeader(http.StatusTemporaryRedirect)
 	})
