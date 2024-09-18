@@ -31,16 +31,9 @@ type User struct {
 	idToken     string `db: idToken`
 }
 
-type CustomStore struct {
-	cookies *sessions.CookieStore
-	db      *pgx.Conn
-}
-
-func handler(w http.ResponseWriter, r *http.Request) {
-
-	page := Page{"HMR?", 1}
-	t, _ := template.ParseFiles("edit.html")
-	t.Execute(w, page)
+type AuthContext struct {
+	store *sessions.CookieStore
+	db    *pgx.Conn
 }
 
 func bootstrapData(conn *pgx.Conn) error {
@@ -64,15 +57,14 @@ func bootstrapData(conn *pgx.Conn) error {
 	return nil
 }
 
-func (store *CustomStore) AuthMiddleware(next http.Handler) http.Handler {
-	cookieStore := store.cookies
+func (ctx *AuthContext) AuthMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/auth") || strings.HasPrefix(r.URL.Path, "/users") {
 			fmt.Println("skip middle ware")
 			next.ServeHTTP(w, r)
 			return
 		}
-		session, err := cookieStore.Get(r, "session-name")
+		session, err := ctx.store.Get(r, "session-name")
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -91,29 +83,22 @@ func (store *CustomStore) AuthMiddleware(next http.Handler) http.Handler {
 		if !ok {
 			fmt.Println("couldn't make user id an int")
 		}
-		fmt.Printf("userId is: %d\n", session.Values["userId"])
-		// check that the idToken is actually valid
-		// no way that is actually properly validated and escaped, right?????
-		row := store.db.QueryRow(context.Background(), "SELECT idToken FROM users WHERE userId=$1", incomingId)
-		// TODO check err
-		// if err != nil {
-		// 	fmt.Println("Query to get tokens didn't work")
-		// }
-		matched := false
+
 		var dbToken string
-		row.Scan(dbToken)
+		matched := false
+		var dbUserId int
+		rows, err := ctx.db.Query(context.TODO(), "SELECT userId, idToken FROM users WHERE userId = $1", incomingId)
+		if err != nil {
+			fmt.Printf("db fetch err %s\n", err)
+		}
+		for rows.Next() {
+			rows.Scan(&dbUserId, &dbToken)
+			fmt.Printf("userId: %d dbToken: %s\n", dbUserId, dbToken)
+		}
 		fmt.Printf("db token: %s, incoming: %s", dbToken, session.Values["idToken"])
 		if dbToken == session.Values["idToken"] {
 			matched = true
 		}
-		// this does not scale well at all, need to figure out how to embed userId into cookie
-		// for rows.Next() {
-		// 	rows.Scan(&dbToken)
-		// 	fmt.Printf("dbToken: %s\n", dbToken)
-		// 	if dbToken == session.Values["idToken"] {
-		// 		matched = true
-		// 	}
-		// }
 		if !matched {
 			fmt.Println("user must log in 2")
 			http.Redirect(w, r, "/auth/login", http.StatusTemporaryRedirect)
@@ -145,14 +130,15 @@ func main() {
 	}
 	defer conn.Close(context.Background())
 
-	err = bootstrapData(conn)
-	if err != nil {
-		os.Exit(1)
-	}
+	// HMR is causing this to re-run a whole bunch. Need to decouple bootstrap from main
+	// err = bootstrapData(conn)
+	// if err != nil {
+	// 	os.Exit(1)
+	// }
 
 	p := pat.New()
 	var store = sessions.NewCookieStore([]byte(os.Getenv("SESSION_KEY")))
-	amw := CustomStore{cookies: store, db: conn}
+	amw := AuthContext{store: store, db: conn}
 	p.Use(amw.AuthMiddleware)
 	p.Get("/users", func(w http.ResponseWriter, r *http.Request) {
 		session, err := store.Get(r, "session-name")
@@ -164,7 +150,7 @@ func main() {
 		fmt.Printf("idToken: %s\n", idToken)
 		var email string
 		// var user User
-		err = conn.QueryRow(context.Background(), "SELECT idToken FROM users where userId=$1", 2).Scan(&email)
+		err = conn.QueryRow(context.TODO(), "SELECT idToken FROM users where userId=$1", 2).Scan(&email)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error selecting users: %v\n", err)
 		}
@@ -211,10 +197,14 @@ func main() {
 			return
 		}
 		var id int
+		fmt.Printf("user token pre insert: %s\n", user.IDToken)
 		// this shouldn't always insert, should update if user existed before but not logged in
-		row := conn.QueryRow(context.Background(), "INSERT INTO users (firstName, lastName, authService, idToken) VALUES ($1, $2, $3, $4) RETURNING userId", user.FirstName, user.LastName, "google", user.IDToken)
+		row := conn.QueryRow(context.TODO(), "INSERT INTO users (firstName, lastName, authService, idToken) VALUES ($1, $2, $3, $4) RETURNING userId", user.FirstName, user.LastName, "google", user.IDToken)
 		// check error TODO
-		row.Scan(&id)
+		err = row.Scan(&id)
+		if err != nil {
+			fmt.Printf("error insert users: %s\n", err)
+		}
 		fmt.Printf("id: %d\n", id)
 		// if err != nil {
 		// 	fmt.Fprintln(res, err)
