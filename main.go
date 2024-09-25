@@ -63,6 +63,7 @@ func bootstrapData(conn *pgx.Conn) error {
 
 func (bg *AuthContext) AuthMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Println("hello from handler func")
 		if strings.HasPrefix(r.URL.Path, "/auth") || strings.HasPrefix(r.URL.Path, "/users") {
 			next.ServeHTTP(w, r)
 			return
@@ -85,7 +86,7 @@ func (bg *AuthContext) AuthMiddleware(next http.Handler) http.Handler {
 
 		var user User
 		bg.db.QueryRow(context.TODO(), "SELECT * FROM users WHERE userId = $1", incomingId).Scan(&user.UserId, &user.FirstName, &user.LastName, &user.AuthService, &user.IdToken)
-		if user.IdToken != session.Values["idToken"] {
+		if user.IdToken == "" || user.IdToken != session.Values["idToken"] {
 			fmt.Println("user must log in 2")
 			http.Redirect(w, r, "/auth/login", http.StatusTemporaryRedirect)
 			return
@@ -209,10 +210,21 @@ func main() {
 
 	p.Get("/logout/{provider}", func(res http.ResponseWriter, req *http.Request) {
 		// Need to delete cookies
+		session, err := store.Get(req, "session-name")
+		if err != nil {
+			http.Error(res, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
 		gothic.Logout(res, req)
+		// store.
+		session.Values["idToken"] = ""
+		session.Values["userId"] = -1
+		session.Save(req, res)
+
 		fmt.Printf("url user: %s\n", req.URL.User)
 		// _, err = conn.Exec(context.Background(), "DELETE FROM users WHERE ")
-		res.Header().Set("Location", "/")
+		res.Header().Set("Location", "/auth/login")
 		res.WriteHeader(http.StatusTemporaryRedirect)
 	})
 
