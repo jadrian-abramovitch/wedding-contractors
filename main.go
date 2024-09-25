@@ -24,17 +24,21 @@ type Page struct {
 }
 
 type User struct {
-	userId      int    `db:userId`
-	firstName   string `db: firstName`
-	lastName    string `db: lastName`
-	authService string `db: authService`
-	idToken     string `db: idToken`
+	UserId      int
+	FirstName   string
+	LastName    string
+	AuthService string
+	IdToken     string
 }
 
 type AuthContext struct {
 	store *sessions.CookieStore
 	db    *pgx.Conn
 }
+
+type ContextKey string
+
+var ctxKey ContextKey = "user"
 
 func bootstrapData(conn *pgx.Conn) error {
 
@@ -57,55 +61,37 @@ func bootstrapData(conn *pgx.Conn) error {
 	return nil
 }
 
-func (ctx *AuthContext) AuthMiddleware(next http.Handler) http.Handler {
+func (bg *AuthContext) AuthMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/auth") || strings.HasPrefix(r.URL.Path, "/users") {
-			fmt.Println("skip middle ware")
 			next.ServeHTTP(w, r)
 			return
 		}
-		session, err := ctx.store.Get(r, "session-name")
+		session, err := bg.store.Get(r, "session-name")
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		if session.Values["idToken"] == nil {
-			fmt.Println("user must log in")
-			http.Redirect(w, r, "/auth/login", http.StatusTemporaryRedirect)
-			return
-		}
-		if session.Values["userId"] == nil {
-			fmt.Println("user has no id")
+		if session.Values["idToken"] == nil || session.Values["userId"] == nil {
 			http.Redirect(w, r, "/auth/login", http.StatusTemporaryRedirect)
 			return
 		}
 		incomingId, ok := session.Values["userId"].(int)
 		if !ok {
-			fmt.Println("couldn't make user id an int")
+			fmt.Println("couldn't parse user id")
+			http.Redirect(w, r, "/auth/login", http.StatusTemporaryRedirect)
+			return
 		}
 
-		var dbToken string
-		matched := false
-		var dbUserId int
-		rows, err := ctx.db.Query(context.TODO(), "SELECT userId, idToken FROM users WHERE userId = $1", incomingId)
-		if err != nil {
-			fmt.Printf("db fetch err %s\n", err)
-		}
-		for rows.Next() {
-			rows.Scan(&dbUserId, &dbToken)
-			fmt.Printf("userId: %d dbToken: %s\n", dbUserId, dbToken)
-		}
-		fmt.Printf("db token: %s, incoming: %s", dbToken, session.Values["idToken"])
-		if dbToken == session.Values["idToken"] {
-			matched = true
-		}
-		if !matched {
+		var user User
+		bg.db.QueryRow(context.TODO(), "SELECT * FROM users WHERE userId = $1", incomingId).Scan(&user.UserId, &user.FirstName, &user.LastName, &user.AuthService, &user.IdToken)
+		if user.IdToken != session.Values["idToken"] {
 			fmt.Println("user must log in 2")
 			http.Redirect(w, r, "/auth/login", http.StatusTemporaryRedirect)
 			return
 		}
-		fmt.Printf("session: %s\n", session.Values["idToken"])
-		fmt.Println("hello from middle ware")
+
+		r = r.WithContext(context.WithValue(r.Context(), ctxKey, user))
 		next.ServeHTTP(w, r)
 	})
 }
@@ -149,7 +135,6 @@ func main() {
 		idToken := session.Values["idToken"]
 		fmt.Printf("idToken: %s\n", idToken)
 		var email string
-		// var user User
 		err = conn.QueryRow(context.TODO(), "SELECT idToken FROM users where userId=$1", 2).Scan(&email)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error selecting users: %v\n", err)
@@ -199,7 +184,7 @@ func main() {
 		var id int
 		fmt.Printf("user token pre insert: %s\n", user.IDToken)
 		// this shouldn't always insert, should update if user existed before but not logged in
-		row := conn.QueryRow(context.TODO(), "INSERT INTO users (firstName, lastName, authService, idToken) VALUES ($1, $2, $3, $4) RETURNING userId", user.FirstName, user.LastName, "google", user.IDToken)
+		row := conn.QueryRow(context.TODO(), "INSERT INTO users (firstName, lastName, authService, idToken) VALUES ($1, $2, $3, $4) RETURNING userId", user.FirstName, user.LastName, user.Provider, user.IDToken)
 		// check error TODO
 		err = row.Scan(&id)
 		if err != nil {
@@ -223,6 +208,7 @@ func main() {
 	})
 
 	p.Get("/logout/{provider}", func(res http.ResponseWriter, req *http.Request) {
+		// Need to delete cookies
 		gothic.Logout(res, req)
 		fmt.Printf("url user: %s\n", req.URL.User)
 		// _, err = conn.Exec(context.Background(), "DELETE FROM users WHERE ")
@@ -246,8 +232,11 @@ func main() {
 	})
 
 	p.Get("/", func(res http.ResponseWriter, req *http.Request) {
+		user := req.Context().Value(ctxKey).(User)
+
+		fmt.Printf("user id from the middleware is: %d, %s\n", user.UserId, user.IdToken)
 		t, _ := template.New("home").Parse(homeTemplate)
-		t.Execute(res, 1)
+		t.Execute(res, user)
 	})
 
 	fmt.Println("listening on http://localhost:")
@@ -277,4 +266,6 @@ var userTemplate = `
 <p>ExpiresAt: {{.ExpiresAt}}</p>
 <p>RefreshToken: {{.RefreshToken}}</p>
 `
-var homeTemplate = `<h1>Home</h1>`
+var homeTemplate = `<h1>Home</h1>
+<p><a href="/logout/{{.AuthService}}">logout</a></p>
+`
