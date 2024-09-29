@@ -18,17 +18,13 @@ import (
 	"github.com/markbates/goth/gothic"
 )
 
-type Page struct {
-	Title string
-	id    int
-}
-
 type User struct {
 	UserId      int
 	FirstName   string
 	LastName    string
 	AuthService string
 	IdToken     string
+	ExpiresAt   time.Time
 }
 
 type AuthContext struct {
@@ -37,6 +33,11 @@ type AuthContext struct {
 }
 
 type ContextKey string
+
+type ProviderIndex struct {
+	Providers    []string
+	ProvidersMap map[string]string
+}
 
 var ctxKey ContextKey = "user"
 
@@ -47,17 +48,17 @@ func bootstrapData(conn *pgx.Conn) error {
 		fmt.Fprintf(os.Stderr, "Unable to create tables: %v\n", err)
 		return err
 	}
-	_, err = conn.Exec(context.Background(), "CREATE TABLE IF NOT EXISTS users (userId integer primary key generated always as identity, firstName TEXT, lastName TEXT, authService TEXT, idToken TEXT)")
+	_, err = conn.Exec(context.Background(), "CREATE TABLE IF NOT EXISTS users (userId integer primary key generated always as identity, firstName TEXT, lastName TEXT, authService TEXT, idToken TEXT, expiresAt TIMESTAMP NOT NULL)")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Unable to create tables: %v\n", err)
 		return err
 	}
 
-	_, err = conn.Exec(context.Background(), "INSERT INTO users (firstName, lastName, authService, idToken) VALUES ('Lauren', 'Homann', 'google', '1')")
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Unable to insert users: %v\n", err)
-		return err
-	}
+	// _, err = conn.Exec(context.Background(), "INSERT INTO users (firstName, lastName, authService, idToken, ) VALUES ('Lauren', 'Homann', 'google', '1')")
+	// if err != nil {
+	// 	fmt.Fprintf(os.Stderr, "Unable to insert users: %v\n", err)
+	// 	return err
+	// }
 	return nil
 }
 
@@ -68,7 +69,7 @@ func (bg *AuthContext) AuthMiddleware(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		session, err := bg.store.Get(r, "session-name")
+		session, err := bg.store.Get(r, os.Getenv("SESSION_NAME"))
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -85,11 +86,16 @@ func (bg *AuthContext) AuthMiddleware(next http.Handler) http.Handler {
 		}
 
 		var user User
-		bg.db.QueryRow(context.TODO(), "SELECT * FROM users WHERE userId = $1", incomingId).Scan(&user.UserId, &user.FirstName, &user.LastName, &user.AuthService, &user.IdToken)
+		bg.db.QueryRow(context.TODO(), "SELECT * FROM users WHERE userId = $1", incomingId).Scan(&user.UserId, &user.FirstName, &user.LastName, &user.AuthService, &user.IdToken, &user.ExpiresAt)
 		if user.IdToken == "" || user.IdToken != session.Values["idToken"] {
 			fmt.Println("user must log in 2")
 			http.Redirect(w, r, "/auth/login", http.StatusTemporaryRedirect)
 			return
+		}
+
+		if time.Now().Compare(user.ExpiresAt) == 1 {
+			fmt.Println("Session expired")
+			http.Redirect(w, r, "/auth/login", http.StatusTemporaryRedirect)
 		}
 
 		r = r.WithContext(context.WithValue(r.Context(), ctxKey, user))
@@ -128,40 +134,14 @@ func main() {
 	amw := AuthContext{store: store, db: conn}
 	p.Use(amw.AuthMiddleware)
 	p.Get("/users", func(w http.ResponseWriter, r *http.Request) {
-		session, err := store.Get(r, "session-name")
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		idToken := session.Values["idToken"]
-		fmt.Printf("idToken: %s\n", idToken)
-		var email string
-		err = conn.QueryRow(context.TODO(), "SELECT idToken FROM users where userId=$1", 2).Scan(&email)
+		var numUsers int
+		err = conn.QueryRow(context.TODO(), "SELECT COUNT(*) FROM users").Scan(&numUsers)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error selecting users: %v\n", err)
 		}
 		t, _ := template.ParseFiles("users.html")
-		fmt.Println(email)
-		t.Execute(w, email)
-	})
-
-	p.Get("/cookies", func(res http.ResponseWriter, req *http.Request) {
-		// Get a session. Get() always returns a session, even if empty.
-		session, err := store.Get(req, "session-name")
-		if err != nil {
-			http.Error(res, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		// Set some session values.
-		session.Values["foo"] = "bar"
-		session.Values[42] = 43
-		// Save it before we write to the response/return from the handler.
-		err = session.Save(req, res)
-		if err != nil {
-			http.Error(res, err.Error(), http.StatusInternalServerError)
-			return
-		}
+		fmt.Println(numUsers)
+		t.Execute(w, numUsers)
 	})
 
 	p.Get("/auth/{provider}/callback", func(res http.ResponseWriter, req *http.Request) {
@@ -172,7 +152,7 @@ func main() {
 			return
 		}
 
-		session, err := store.Get(req, "session-name")
+		session, err := store.Get(req, os.Getenv("SESSION_NAME"))
 		if err != nil {
 			http.Error(res, err.Error(), http.StatusInternalServerError)
 			return
@@ -182,22 +162,26 @@ func main() {
 			fmt.Println("token is not expired yet")
 			return
 		}
+
 		var id int
-		fmt.Printf("user token pre insert: %s\n", user.IDToken)
-		// this shouldn't always insert, should update if user existed before but not logged in
-		row := conn.QueryRow(context.TODO(), "INSERT INTO users (firstName, lastName, authService, idToken) VALUES ($1, $2, $3, $4) RETURNING userId", user.FirstName, user.LastName, user.Provider, user.IDToken)
-		// check error TODO
+		row := conn.QueryRow(context.TODO(), "SELECT userId FROM users WHERE idToken=$1", user.UserID)
+		err = row.Scan(&id)
+		if err != nil {
+			// user does not exist in the system yet
+			row = conn.QueryRow(context.TODO(), "INSERT INTO users (firstName, lastName, authService, idToken, expiresAt) VALUES ($1, $2, $3, $4, $5) RETURNING userId", user.FirstName, user.LastName, user.Provider, user.UserID, user.ExpiresAt)
+		} else {
+			// user exists in the system already
+			_, updateErr := conn.Exec(context.TODO(), "UPDATE users SET expiresAt=$1 WHERE userId=$2", user.ExpiresAt, id)
+			if updateErr != nil {
+				fmt.Println("could not update user expires at")
+			}
+		}
 		err = row.Scan(&id)
 		if err != nil {
 			fmt.Printf("error insert users: %s\n", err)
 		}
-		fmt.Printf("id: %d\n", id)
-		// if err != nil {
-		// 	fmt.Fprintln(res, err)
-		// 	return
-		// }
 
-		session.Values["idToken"] = user.IDToken
+		session.Values["idToken"] = user.UserID
 		session.Values["userId"] = id
 		err = session.Save(req, res)
 		if err != nil {
@@ -209,21 +193,17 @@ func main() {
 	})
 
 	p.Get("/logout/{provider}", func(res http.ResponseWriter, req *http.Request) {
-		// Need to delete cookies
-		session, err := store.Get(req, "session-name")
+		session, err := store.Get(req, os.Getenv("SESSION_NAME"))
 		if err != nil {
 			http.Error(res, err.Error(), http.StatusInternalServerError)
 			return
 		}
 
 		gothic.Logout(res, req)
-		// store.
 		session.Values["idToken"] = ""
 		session.Values["userId"] = -1
 		session.Save(req, res)
 
-		fmt.Printf("url user: %s\n", req.URL.User)
-		// _, err = conn.Exec(context.Background(), "DELETE FROM users WHERE ")
 		res.Header().Set("Location", "/auth/login")
 		res.WriteHeader(http.StatusTemporaryRedirect)
 	})
@@ -246,19 +226,12 @@ func main() {
 	p.Get("/", func(res http.ResponseWriter, req *http.Request) {
 		user := req.Context().Value(ctxKey).(User)
 
-		fmt.Printf("user id from the middleware is: %d, %s\n", user.UserId, user.IdToken)
 		t, _ := template.New("home").Parse(homeTemplate)
 		t.Execute(res, user)
 	})
 
-	fmt.Println("listening on http://localhost:")
-	log.Println("listening on localhost:8000")
+	log.Printf("listening on http://localhost%s", os.Getenv("EXPOSED_PORT"))
 	log.Fatal(http.ListenAndServe(os.Getenv("EXPOSED_PORT"), p))
-}
-
-type ProviderIndex struct {
-	Providers    []string
-	ProvidersMap map[string]string
 }
 
 var indexTemplate = `{{range $key,$value:=.Providers}}
